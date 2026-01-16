@@ -10,7 +10,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,8 +19,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git make clang lld \
+            perl python3 \
             libplist-utils zstd \
-            zip unzip curl rsync
+            zip unzip curl rsync \
+            xz-utils jq
 
       - name: Setup Theos
         run: |
@@ -30,40 +31,39 @@ jobs:
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
 
-      - name: Install iOS SDKs for Theos (force)
+      - name: Install iOS SDKs for Theos
         run: |
-          set -e
           rm -rf "$HOME/theos/sdks"
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
           echo "Installed SDKs:"
           find "$HOME/theos/sdks" -maxdepth 2 -type d -name "*.sdk" -print
 
-      - name: Verify SDKs
+      - name: Install Theos Linux iOS toolchain
         run: |
-          if ! find "$HOME/theos/sdks" -maxdepth 2 -type d -name "*.sdk" | grep -q . ; then
-            echo "❌ No iOS SDKs found"
-            exit 1
-          fi
-          echo "✅ SDK check passed"
+          set -e
+          mkdir -p "$HOME/theos/toolchain/linux"
+          rm -rf "$HOME/theos/toolchain/linux/iphone"
+          git clone --depth=1 https://github.com/theos/toolchain.git /tmp/theos-toolchain
+          # toolchain repo contains prebuilt toolchains, we only need linux/iphone
+          rsync -a /tmp/theos-toolchain/linux/iphone/ "$HOME/theos/toolchain/linux/iphone/"
+          echo "Toolchain files:"
+          ls -la "$HOME/theos/toolchain/linux/iphone/bin" || true
+          test -f "$HOME/theos/toolchain/linux/iphone/bin/clang"
+          test -f "$HOME/theos/toolchain/linux/iphone/bin/clang++"
 
       - name: Build package
         run: |
           make clean package FINALPACKAGE=1
-          echo "==== Build outputs ===="
+          echo "==== outputs ===="
           find . -maxdepth 4 -type f \( -name "*.deb" -o -name "*.dylib" \) -print || true
           find .theos -type f -name "*.dylib" -print || true
 
       - name: Collect artifacts
         run: |
           mkdir -p out
-          # deb
           find . -type f -name "*.deb" -exec cp -v {} out/ \; || true
-          # dylib
           find .theos -type f -name "*.dylib" -exec cp -v {} out/ \; || true
-          # source
-          zip -r out/TSInjectUI_source.zip . \
-            -x ".git/*" \
-            -x "out/*"
+          zip -r out/TSInjectUI_source.zip . -x ".git/*" -x "out/*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
