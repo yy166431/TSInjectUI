@@ -1,0 +1,9 @@
+Package: com.github.tsinjectui
+Name: TSInjectUI
+Depends: firmware (>= 14.0)
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: TrollStore inject floating UI (alert + ON/OFF button)
+Maintainer: you
+Author: you
+Section: Tweaks
