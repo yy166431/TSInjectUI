@@ -1,4 +1,4 @@
-name: Build TSInjectUI (dylib only)
+name: Build TSInjectUI (dylib only, macOS)
 
 on:
   workflow_dispatch:
@@ -18,7 +18,9 @@ jobs:
       - name: Install dependencies
         run: |
           brew update
-          brew install make
+          # make: ensure GNU make is available
+          # ldid: required by theos signing step (even for dylib)
+          brew install make ldid
 
       - name: Setup Theos
         run: |
