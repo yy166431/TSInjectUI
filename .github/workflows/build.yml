@@ -18,8 +18,6 @@ jobs:
       - name: Install dependencies
         run: |
           brew update
-          # make: ensure GNU make is available
-          # ldid: required by theos signing step (even for dylib)
           brew install make ldid
 
       - name: Setup Theos
@@ -33,18 +31,24 @@ jobs:
         run: |
           rm -rf "$HOME/theos/sdks"
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
-          echo "Installed SDKs:"
-          find "$HOME/theos/sdks" -maxdepth 2 -type d -name "*.sdk" -print
 
       - name: Build dylib only
         run: |
           make clean
           make
           echo "==== dylib outputs ===="
-          find .theos -type f -name "*.dylib" -print || true
+          ls -la .theos/obj/debug || true
+          ls -la .theos/obj/debug/arm64 || true
+
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          cp -v .theos/obj/debug/TSInjectUI.dylib out/ || true
+          cp -v .theos/obj/debug/arm64/TSInjectUI.dylib out/ || true
+          ls -la out
 
       - name: Upload dylib artifact
         uses: actions/upload-artifact@v4
         with:
           name: TSInjectUI-dylib
-          path: .theos/**/*.dylib
+          path: out/*
