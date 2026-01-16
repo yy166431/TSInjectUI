@@ -10,34 +10,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git make clang lld libplist-utils zstd zip unzip curl
+          sudo apt-get install -y \
+            git make clang lld \
+            libplist-utils zstd \
+            zip unzip curl rsync
 
       - name: Setup Theos
-        run: |
-          rm -rf "$HOME/theos"
-          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          echo "$HOME/theos/bin" >> $GITHUB_PATH
-
-      - name: Install iOS SDKs for Theos (safe)
-        run: |
-          # If theos already has sdks, don't overwrite; otherwise clone
-          if [ -d "$HOME/theos/sdks" ] && [ "$(ls -A $HOME/theos/sdks 2>/dev/null)" ]; then
-            echo "sdks already exists, skip"
-          else
-            rm -rf "$HOME/theos/sdks"
-            git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
-          fi
-
-      - name: Build package
-        run: |
-          make clean package FINALPACKAGE=1
-          echo "=== outputs ==="
-          find . -m
