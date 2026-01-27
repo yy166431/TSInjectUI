@@ -8,7 +8,7 @@
 
 static NSString * const TS_REPORT_URL   = @"http://159.75.14.193:8099/api/mjlog";
 // 如果你服务端启用了 token（LOG_TOKEN），就把下面改成同一个值；如果没启用，留空即可
-static NSString * const TS_REPORT_TOKEN = @"";  // e.g. @"your_token_here"
+static NSString * const TS_REPORT_TOKEN = @""; // ignored in test
 
 // 简单 ISO8601 时间
 
@@ -36,74 +36,144 @@ static NSString *TSNowISO8601(void) {
     return [f stringFromDate:[NSDate date]];
 }
 
-static void TSReportJSON(NSDictionary *obj) {
-    if (!TS_REPORT_URL.length) return;
+static BOOL TSSendRawJSON(NSDictionary *obj, NSInteger *outStatus, NSString **outResp) {
+    if (!TS_REPORT_URL.length) return NO;
 
     NSError *err = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:&err];
     if (!data || err) {
         TSLOG(@"json encode fail: %@", err.localizedDescription ?: @"");
         TSAppendLocal([NSString stringWithFormat:@"[%@] json encode fail: %@", TSNowISO8601(), err.localizedDescription ?: @""]);
-        return;
+        return NO;
     }
 
     NSURL *url = [NSURL URLWithString:TS_REPORT_URL];
     if (!url) {
         TSLOG(@"bad url: %@", TS_REPORT_URL);
         TSAppendLocal([NSString stringWithFormat:@"[%@] bad url: %@", TSNowISO8601(), TS_REPORT_URL]);
-        return;
+        return NO;
     }
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
-    req.timeoutInterval = 5.0;
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-
-    // 测试阶段：默认不需要 LOG_TOKEN；如果你以后开启了服务端 token，再填 TS_REPORT_TOKEN
-    if (TS_REPORT_TOKEN.length) {
-        [req setValue:TS_REPORT_TOKEN forHTTPHeaderField:@"X-Log-Token"];
-    }
-
+    // 测试阶段：忽略 token（不发、不校验）
     req.HTTPBody = data;
+    req.timeoutInterval = 4.0;
 
-    TSLOG(@"POST -> %@", TS_REPORT_URL);
+    __block NSInteger status = 0;
+    __block NSString *respStr = @"";
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
 
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.timeoutIntervalForRequest = 5.0;
-    cfg.timeoutIntervalForResource = 5.0;
-
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-    NSURLSessionDataTask *task =
-    [session dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        NSInteger code = 0;
-        if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = ((NSHTTPURLResponse *)r).statusCode;
-
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable d, NSURLResponse * _Nullable r, NSError * _Nullable e) {
         if (e) {
-            TSLOG(@"POST fail code=%ld err=%@", (long)code, e.localizedDescription ?: @"");
-            TSAppendLocal([NSString stringWithFormat:@"[%@] POST FAIL code=%ld err=%@",
-                           TSNowISO8601(), (long)code, e.localizedDescription ?: @""]);
+            TSLOG(@"POST fail: %@", e.localizedDescription ?: @"");
+            TSAppendLocal([NSString stringWithFormat:@"[%@] POST fail: %@", TSNowISO8601(), e.localizedDescription ?: @""]);
+            dispatch_semaphore_signal(sema);
             return;
         }
+        if ([r isKindOfClass:[NSHTTPURLResponse class]]) {
+            status = ((NSHTTPURLResponse *)r).statusCode;
+        }
+        if (d.length) {
+            respStr = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+        }
+        dispatch_semaphore_signal(sema);
+    }] resume];
 
-        NSString *resp = @"";
-        if (d.length) resp = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
-        TSLOG(@"POST ok code=%ld resp=%@", (long)code, resp);
-        TSAppendLocal([NSString stringWithFormat:@"[%@] POST OK code=%ld", TSNowISO8601(), (long)code]);
-    }];
-    [task resume];
+    dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)));
+
+    if (outStatus) *outStatus = status;
+    if (outResp) *outResp = respStr;
+    return (status >= 200 && status < 300);
 }
 
+#pragma mark - ====== Report Queue (rate-limit + retry) ======
 
-static void TSReport(NSString *type, NSDictionary *payload) {
+static NSString *gMatchID = nil;
+static NSMutableArray<NSDictionary *> *gQueue = nil;
+static BOOL gFlushing = NO;
+static CFAbsoluteTime gLastSnapshotTS = 0;
+
+static NSString *TSNewMatchID(void) { return [NSUUID UUID].UUIDString; }
+
+static void TSEnsureQueue(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gQueue = [NSMutableArray array];
+        gMatchID = TSNewMatchID();
+    });
+}
+
+static BOOL TSAllowSnapshot(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastSnapshotTS < 1.0) return NO;
+    gLastSnapshotTS = now;
+    return YES;
+}
+
+static void TSFlushQueue(void);
+
+static void TSEnqueueEvent(NSString *type, NSDictionary *payload) {
+    // snapshot 限频（1 秒 1 次）
+    if (type && [type isEqualToString:@"snapshot"] && !TSAllowSnapshot()) {
+        return;
+    }
+    TSEnsureQueue();
+
     NSMutableDictionary *obj = [NSMutableDictionary dictionary];
     obj[@"t"] = TSNowISO8601();
     obj[@"type"] = type ?: @"unknown";
     obj[@"payload"] = payload ?: @{};
     obj[@"device"] = UIDevice.currentDevice.model ?: @"";
     obj[@"sys"] = UIDevice.currentDevice.systemVersion ?: @"";
-    if (TS_REPORT_TOKEN.length) obj[@"token"] = TS_REPORT_TOKEN; // 兼容 body token
-    TSReportJSON(obj);
+    obj[@"match_id"] = gMatchID ?: @"";
+
+    @synchronized (gQueue) {
+        [gQueue addObject:obj];
+        if (gQueue.count > 200) [gQueue removeObjectAtIndex:0];
+    }
+    TSFlushQueue();
 }
+
+static void TSFlushQueue(void) {
+    if (gFlushing) return;
+    gFlushing = YES;
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        while (1) {
+            NSDictionary *next = nil;
+            @synchronized (gQueue) {
+                if (gQueue.count == 0) break;
+                next = gQueue.firstObject;
+            }
+            if (!next) break;
+
+            NSInteger st = 0;
+            NSString *resp = nil;
+            BOOL ok = TSSendRawJSON(next, &st, &resp);
+
+            TSLOG(@"POST status=%ld ok=%d", (long)st, ok ? 1 : 0);
+            if (!ok) {
+                // 网络/服务器失败：先停，等待下次触发再重试
+                break;
+            }
+
+            @synchronized (gQueue) {
+                if (gQueue.count > 0) [gQueue removeObjectAtIndex:0];
+            }
+        }
+        gFlushing = NO;
+    });
+}
+
+
+
+static void TSReport(NSString *type, NSDictionary *payload) {
+    // 统一走队列，真机无控制台也能稳定上报
+    TSEnqueueEvent(type, payload);
+}
+
 
 #pragma mark - ====== Globals ======
 
@@ -202,7 +272,7 @@ static __attribute__((unused)) UIWindow *TSKeyWindow(void) {
     return nil;
 }
 
-static __attribute__((unused)) UIViewController *TopVC(void) {
+static UIViewController *TopVC(void) {
     UIWindow *w = TSKeyWindow();
     if (!w) return nil;
     UIViewController *vc = w.rootViewController;
@@ -357,50 +427,6 @@ static void HidePanel(void) {
 
 static BOOL gAutoInstalled = NO;
 
-static void InstallAutoObserverOnce(void) {
-    if (gAutoInstalled) return;
-    gAutoInstalled = YES;
-
-    ResetAll();
-    TSReport(@"event", @{@"name": @"auto_observer_installed"});
-
-    // 自动扣牌通知：
-    // [[NSNotificationCenter defaultCenter] postNotificationName:@"TS_MJ_SEEN"
-    //                                                     object:nil
-    //                                                   userInfo:@{@"tile": @(tileId), @"count": @(n)}];
-    [[NSNotificationCenter defaultCenter] addObserverForName:@"TS_MJ_SEEN"
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification * _Nonnull note) {
-        NSDictionary *u = note.userInfo ?: @{};
-        NSNumber *tile = u[@"tile"];
-        NSNumber *count = u[@"count"];
-        if (!tile) return;
-
-        int tid = tile.intValue;
-        int cnt = count ? count.intValue : 1;
-
-        // 你也可以改成 OFF 也统计；当前：OFF 不统计
-        if (!gEnabled) {
-            TSReport(@"event", @{@"name": @"auto_seen_ignored_off", @"tile": @(tid), @"count": @(cnt)});
-            return;
-        }
-
-        MarkSeenIdx(tid, cnt);
-        TSRefreshPanel();
-        TSReport(@"event", @{@"name": @"auto_seen", @"tile": @(tid), @"count": @(cnt), @"left": @(gLeft[tid])});
-    }];
-
-    // 开局重置
-    [[NSNotificationCenter defaultCenter] addObserverForName:@"TS_MJ_RESET"
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification * _Nonnull note) {
-        ResetAll();
-        TSRefreshPanel();
-        TSReport(@"event", @{@"name": @"auto_reset"});
-    }];
-}
 
 #pragma mark - ====== Passthrough Window ======
 
@@ -458,9 +484,7 @@ static void Toggle(void) {
 
     TSReport(@"event", @{@"name": @"toggle", @"enabled": @(gEnabled)});
 
-    if (gEnabled) {
-        InstallAutoObserverOnce();
-        if (gOverlayWindow && gOverlayWindow.rootViewController) {
+    if (gEnabled) {        if (gOverlayWindow && gOverlayWindow.rootViewController) {
             ShowPanel(gOverlayWindow.rootViewController.view);
         }
     } else {
@@ -470,7 +494,7 @@ static void Toggle(void) {
 
 #pragma mark - ====== UI Setup ======
 
-static __attribute__((unused)) void SetupUI(void) {
+static void SetupUI(void) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     gEnabled = [ud boolForKey:kEnabledKey];
 
@@ -530,15 +554,23 @@ static __attribute__((unused)) void SetupUI(void) {
     TSReport(@"event", @{@"name": @"setup_ui", @"enabled_restore": @(gEnabled)});
 
     // 如果之前就是 ON，恢复面板
-    if (gEnabled) {
-        InstallAutoObserverOnce();
-        ShowPanel(vc.view);
+    if (gEnabled) {        ShowPanel(vc.view);
     }
 }
 
 #pragma mark - ====== Entry ======
 
 __attribute__((constructor))
+static void TSInstallLifecycleHooks(void) {
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification * _Nonnull note) {
+        TSReport(@"app_active", @{});
+        TSFlushQueue();
+    }];
+}
+
 __attribute__((constructor))
 static void Entry(void) {
     TSLOG(@"Entry reached (constructor)");
@@ -548,9 +580,30 @@ static void Entry(void) {
         TSLOG(@"Main queue reached");
         AudioServicesPlaySystemSound(1519);
 
-        // 证明上报函数被调用
-        TSLOG(@"About to report dylib_loaded");
+        TSInstallLifecycleHooks();
+
+        // 先上报 dylib_loaded（走队列）
         TSReport(@"dylib_loaded", @{});
+
+        // 延迟一点再挂 UI，确保场景 ready
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            // 弹窗可选：用于验证加载成功（如果不想弹窗，注释掉即可）
+            UIViewController *vc = TopVC();
+            if (vc) {
+                UIAlertController *a =
+                [UIAlertController alertControllerWithTitle:@"TSInject"
+                                                    message:@"插件已加载（测试模式）"
+                                             preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:nil]];
+                [vc presentViewController:a animated:YES completion:nil];
+            }
+
+            SetupUI();
+        });
     });
 }
+
 
