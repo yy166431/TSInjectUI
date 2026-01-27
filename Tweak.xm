@@ -185,7 +185,7 @@ static void UndoOne(void) {
 
 #pragma mark - ====== Helpers ======
 
-static UIWindow *TSKeyWindow(void) {
+static __attribute__((unused)) UIWindow *TSKeyWindow(void) {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
@@ -202,7 +202,7 @@ static UIWindow *TSKeyWindow(void) {
     return nil;
 }
 
-static UIViewController *TopVC(void) {
+static __attribute__((unused)) UIViewController *TopVC(void) {
     UIWindow *w = TSKeyWindow();
     if (!w) return nil;
     UIViewController *vc = w.rootViewController;
@@ -470,7 +470,7 @@ static void Toggle(void) {
 
 #pragma mark - ====== UI Setup ======
 
-static void SetupUI(void) {
+static __attribute__((unused)) void SetupUI(void) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     gEnabled = [ud boolForKey:kEnabledKey];
 
