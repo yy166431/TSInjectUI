@@ -425,8 +425,6 @@ static void HidePanel(void) {
 
 #pragma mark - ====== Auto counter via notifications ======
 
-static BOOL gAutoInstalled = NO;
-
 
 #pragma mark - ====== Passthrough Window ======
 
