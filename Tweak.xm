@@ -2,11 +2,19 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 
-#pragma mark - ====== Report to Server (no console needed) ======
+#pragma mark - ====== Report to Server (ATS-proof via raw socket) ======
 
-static NSString * const TS_REPORT_URL   = @"http://159.75.14.193:8099/api/mjlog";
-// 如果你服务端启用了 token（LOG_TOKEN），就把下面改成同一个值；如果没启用，留空即可
-static NSString * const TS_REPORT_TOKEN = @"";  // e.g. @"your_token_here"
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+// 你服务器
+static NSString * const TS_REPORT_HOST  = @"159.75.14.193";
+static const int        TS_REPORT_PORT  = 8099;
+static NSString * const TS_REPORT_PATH  = @"/api/mjlog";
+
+// 如果你服务端启用了 LOG_TOKEN，就填同一个；没启用留空
+static NSString * const TS_REPORT_TOKEN = @"";
 
 // 简单 ISO8601 时间
 static NSString *TSNowISO8601(void) {
@@ -17,32 +25,110 @@ static NSString *TSNowISO8601(void) {
     return [f stringFromDate:[NSDate date]];
 }
 
-static void TSReportJSON(NSDictionary *obj) {
-    if (!TS_REPORT_URL.length) return;
+// 失败也能在真机查看：写到 Caches/tsinject_report.log
+static void TSAppendLocal(NSString *line) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    NSString *dir = paths.firstObject ?: NSTemporaryDirectory();
+    NSString *path = [dir stringByAppendingPathComponent:@"tsinject_report.log"];
 
-    NSError *err = nil;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:&err];
-    if (!data || err) return;
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (!fh) return;
 
-    NSURL *url = [NSURL URLWithString:TS_REPORT_URL];
-    if (!url) return;
+    [fh seekToEndOfFile];
+    NSData *d = [[line stringByAppendingString:@"
+"] dataUsingEncoding:NSUTF8StringEncoding];
+    [fh writeData:d];
+    [fh closeFile];
+}
 
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST";
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+static BOOL TSSendRawHTTPPost(NSData *jsonBody) {
+    if (!jsonBody || jsonBody.length == 0) return NO;
 
-    if (TS_REPORT_TOKEN.length) {
-        [req setValue:TS_REPORT_TOKEN forHTTPHeaderField:@"X-Log-Token"];
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        TSAppendLocal([NSString stringWithFormat:@"[%@] socket() fail", TSNowISO8601()]);
+        return NO;
     }
 
-    req.HTTPBody = data;
-    req.timeoutInterval = 5.0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)TS_REPORT_PORT);
 
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-    NSURLSessionDataTask *task =
-    [session dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {}];
-    [task resume];
+    const char *ip = TS_REPORT_HOST.UTF8String;
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+        close(fd);
+        TSAppendLocal([NSString stringWithFormat:@"[%@] inet_pton fail", TSNowISO8601()]);
+        return NO;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        TSAppendLocal([NSString stringWithFormat:@"[%@] connect fail", TSNowISO8601()]);
+        return NO;
+    }
+
+    NSMutableString *req = [NSMutableString string];
+    [req appendFormat:@"POST %@ HTTP/1.1
+", TS_REPORT_PATH];
+    [req appendFormat:@"Host: %@:%d
+", TS_REPORT_HOST, TS_REPORT_PORT];
+    [req appendString:@"Content-Type: application/json
+"];
+    [req appendFormat:@"Content-Length: %lu
+", (unsigned long)jsonBody.length];
+    [req appendString:@"Connection: close
+"];
+    if (TS_REPORT_TOKEN.length) {
+        [req appendFormat:@"X-Log-Token: %@
+", TS_REPORT_TOKEN];
+    }
+    [req appendString:@"
+"];
+
+    NSData *head = [req dataUsingEncoding:NSUTF8StringEncoding];
+    if (send(fd, head.bytes, (int)head.length, 0) < 0) {
+        close(fd);
+        TSAppendLocal([NSString stringWithFormat:@"[%@] send header fail", TSNowISO8601()]);
+        return NO;
+    }
+    if (send(fd, jsonBody.bytes, (int)jsonBody.length, 0) < 0) {
+        close(fd);
+        TSAppendLocal([NSString stringWithFormat:@"[%@] send body fail", TSNowISO8601()]);
+        return NO;
+    }
+
+    char buf[128] = {0};
+    int n = (int)recv(fd, buf, sizeof(buf)-1, 0);
+    close(fd);
+
+    if (n > 0) {
+        NSString *resp = [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
+        TSAppendLocal([NSString stringWithFormat:@"[%@] OK resp=%@", TSNowISO8601(), resp]);
+    } else {
+        TSAppendLocal([NSString stringWithFormat:@"[%@] OK (no resp)", TSNowISO8601()]);
+    }
+    return YES;
+}
+
+static void TSReportJSON(NSDictionary *obj) {
+    NSError *err = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:&err];
+    if (!data || err) {
+        TSAppendLocal([NSString stringWithFormat:@"[%@] json encode fail %@", TSNowISO8601(), err.localizedDescription ?: @""]);
+        return;
+    }
+    (void)TSSendRawHTTPPost(data);
 }
 
 static void TSReport(NSString *type, NSDictionary *payload) {
@@ -52,7 +138,7 @@ static void TSReport(NSString *type, NSDictionary *payload) {
     obj[@"payload"] = payload ?: @{};
     obj[@"device"] = UIDevice.currentDevice.model ?: @"";
     obj[@"sys"] = UIDevice.currentDevice.systemVersion ?: @"";
-    if (TS_REPORT_TOKEN.length) obj[@"token"] = TS_REPORT_TOKEN; // 兼容 body token
+    if (TS_REPORT_TOKEN.length) obj[@"token"] = TS_REPORT_TOKEN;
     TSReportJSON(obj);
 }
 
