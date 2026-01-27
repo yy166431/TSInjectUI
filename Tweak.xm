@@ -2,7 +2,61 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 
-#pragma mark - Globals
+#pragma mark - ====== Report to Server (no console needed) ======
+
+static NSString * const TS_REPORT_URL   = @"http://159.75.14.193:8099/api/mjlog";
+// 如果你服务端启用了 token（LOG_TOKEN），就把下面改成同一个值；如果没启用，留空即可
+static NSString * const TS_REPORT_TOKEN = @"";  // e.g. @"your_token_here"
+
+// 简单 ISO8601 时间
+static NSString *TSNowISO8601(void) {
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    f.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+    f.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
+    return [f stringFromDate:[NSDate date]];
+}
+
+static void TSReportJSON(NSDictionary *obj) {
+    if (!TS_REPORT_URL.length) return;
+
+    NSError *err = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:&err];
+    if (!data || err) return;
+
+    NSURL *url = [NSURL URLWithString:TS_REPORT_URL];
+    if (!url) return;
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+    if (TS_REPORT_TOKEN.length) {
+        [req setValue:TS_REPORT_TOKEN forHTTPHeaderField:@"X-Log-Token"];
+    }
+
+    req.HTTPBody = data;
+    req.timeoutInterval = 5.0;
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    NSURLSessionDataTask *task =
+    [session dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {}];
+    [task resume];
+}
+
+static void TSReport(NSString *type, NSDictionary *payload) {
+    NSMutableDictionary *obj = [NSMutableDictionary dictionary];
+    obj[@"t"] = TSNowISO8601();
+    obj[@"type"] = type ?: @"unknown";
+    obj[@"payload"] = payload ?: @{};
+    obj[@"device"] = UIDevice.currentDevice.model ?: @"";
+    obj[@"sys"] = UIDevice.currentDevice.systemVersion ?: @"";
+    if (TS_REPORT_TOKEN.length) obj[@"token"] = TS_REPORT_TOKEN; // 兼容 body token
+    TSReportJSON(obj);
+}
+
+#pragma mark - ====== Globals ======
 
 static BOOL gEnabled = NO;
 
@@ -16,7 +70,7 @@ static NSString * const kEnabledKey = @"tsinject_enabled";
 static NSString * const kPosXKey    = @"tsinject_btn_x";
 static NSString * const kPosYKey    = @"tsinject_btn_y";
 
-#pragma mark - Mahjong (108 tiles / 27 kinds)
+#pragma mark - ====== Mahjong (108 tiles / 27 kinds) ======
 
 typedef NS_ENUM(NSInteger, TSMJTile) {
     // 万 1-9
@@ -80,7 +134,7 @@ static void UndoOne(void) {
     MarkBackIdx((int)last.integerValue, 1);
 }
 
-#pragma mark - Helpers
+#pragma mark - ====== Helpers ======
 
 static UIWindow *TSKeyWindow(void) {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -112,33 +166,36 @@ static void UpdateTitle(void) {
     [gBtn setTitle:(gEnabled ? @"ON" : @"OFF") forState:UIControlStateNormal];
 }
 
-#pragma mark - Panel actions handler
+#pragma mark - ====== Panel actions handler ======
 
 @interface TSMJPanelHandler : NSObject
 @end
+
+void TSRefreshPanel(void);
 
 @implementation TSMJPanelHandler
 
 - (void)onTileTap:(UIButton *)sender {
     int idx = (int)(sender.tag - 1000);
     MarkSeenIdx(idx, 1);
-    // 刷新面板
-    extern void TSRefreshPanel(void);
     TSRefreshPanel();
+
+    // 上报：手动点击扣牌
+    TSReport(@"event", @{@"name": @"manual_tap", @"tile": @(idx), @"count": @1, @"left": @(gLeft[idx])});
 }
 
 - (void)onUndo:(id)sender {
     (void)sender;
     UndoOne();
-    extern void TSRefreshPanel(void);
     TSRefreshPanel();
+    TSReport(@"event", @{@"name": @"manual_undo"});
 }
 
 - (void)onReset:(id)sender {
     (void)sender;
     ResetAll();
-    extern void TSRefreshPanel(void);
     TSRefreshPanel();
+    TSReport(@"event", @{@"name": @"manual_reset"});
 }
 
 @end
@@ -152,7 +209,7 @@ static TSMJPanelHandler *GetPanelHandler(void) {
     return h;
 }
 
-#pragma mark - Panel UI
+#pragma mark - ====== Panel UI ======
 
 void TSRefreshPanel(void) {
     if (!gPanel) return;
@@ -247,7 +304,7 @@ static void HidePanel(void) {
     gPanel.hidden = YES;
 }
 
-#pragma mark - Auto counter via notifications
+#pragma mark - ====== Auto counter via notifications ======
 
 static BOOL gAutoInstalled = NO;
 
@@ -256,6 +313,7 @@ static void InstallAutoObserverOnce(void) {
     gAutoInstalled = YES;
 
     ResetAll();
+    TSReport(@"event", @{@"name": @"auto_observer_installed"});
 
     // 自动扣牌通知：
     // [[NSNotificationCenter defaultCenter] postNotificationName:@"TS_MJ_SEEN"
@@ -265,26 +323,37 @@ static void InstallAutoObserverOnce(void) {
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification * _Nonnull note) {
-        if (!gEnabled) return; // OFF 不统计（你也可改成仍统计）
         NSDictionary *u = note.userInfo ?: @{};
         NSNumber *tile = u[@"tile"];
         NSNumber *count = u[@"count"];
         if (!tile) return;
-        MarkSeenIdx(tile.intValue, count ? count.intValue : 1);
+
+        int tid = tile.intValue;
+        int cnt = count ? count.intValue : 1;
+
+        // 你也可以改成 OFF 也统计；当前：OFF 不统计
+        if (!gEnabled) {
+            TSReport(@"event", @{@"name": @"auto_seen_ignored_off", @"tile": @(tid), @"count": @(cnt)});
+            return;
+        }
+
+        MarkSeenIdx(tid, cnt);
         TSRefreshPanel();
+        TSReport(@"event", @{@"name": @"auto_seen", @"tile": @(tid), @"count": @(cnt), @"left": @(gLeft[tid])});
     }];
 
-    // 可选：开局重置
+    // 开局重置
     [[NSNotificationCenter defaultCenter] addObserverForName:@"TS_MJ_RESET"
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(__unused NSNotification * _Nonnull note) {
         ResetAll();
         TSRefreshPanel();
+        TSReport(@"event", @{@"name": @"auto_reset"});
     }];
 }
 
-#pragma mark - Passthrough Window
+#pragma mark - ====== Passthrough Window ======
 
 @interface TSPassthroughWindow : UIWindow
 @end
@@ -302,7 +371,7 @@ static void InstallAutoObserverOnce(void) {
 }
 @end
 
-#pragma mark - Drag Target (button)
+#pragma mark - ====== Drag Target (button) ======
 
 @interface DragTarget : NSObject
 @end
@@ -324,11 +393,12 @@ static void Toggle(void);
         [ud setDouble:v.center.x forKey:kPosXKey];
         [ud setDouble:v.center.y forKey:kPosYKey];
         [ud synchronize];
+        TSReport(@"event", @{@"name": @"btn_drag_end", @"x": @(v.center.x), @"y": @(v.center.y)});
     }
 }
 @end
 
-#pragma mark - Toggle
+#pragma mark - ====== Toggle ======
 
 static void Toggle(void) {
     gEnabled = !gEnabled;
@@ -336,6 +406,8 @@ static void Toggle(void) {
     [ud setBool:gEnabled forKey:kEnabledKey];
     [ud synchronize];
     UpdateTitle();
+
+    TSReport(@"event", @{@"name": @"toggle", @"enabled": @(gEnabled)});
 
     if (gEnabled) {
         InstallAutoObserverOnce();
@@ -347,7 +419,7 @@ static void Toggle(void) {
     }
 }
 
-#pragma mark - UI Setup
+#pragma mark - ====== UI Setup ======
 
 static void SetupUI(void) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
@@ -406,6 +478,8 @@ static void SetupUI(void) {
     objc_setAssociatedObject(UIApplication.sharedApplication, "ts_overlay_window", overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     gOverlayWindow = overlay;
 
+    TSReport(@"event", @{@"name": @"setup_ui", @"enabled_restore": @(gEnabled)});
+
     // 如果之前就是 ON，恢复面板
     if (gEnabled) {
         InstallAutoObserverOnce();
@@ -413,13 +487,16 @@ static void SetupUI(void) {
     }
 }
 
-#pragma mark - Entry
+#pragma mark - ====== Entry ======
 
 __attribute__((constructor))
 static void Entry(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         // 震动提示：dylib 已加载
         AudioServicesPlaySystemSound(1519);
+
+        // 上报：注入成功
+        TSReport(@"event", @{@"name": @"dylib_loaded"});
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -434,6 +511,7 @@ static void Entry(void) {
                                                     handler:nil]];
                 [vc presentViewController:a animated:YES completion:nil];
             }
+
             SetupUI();
         });
     });
