@@ -318,7 +318,7 @@ static void BuildPanelIfNeeded(UIView *host) {
     UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(12, 34, W-24, 18)];
     hint.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75];
     hint.font = [UIFont systemFontOfSize:12];
-    hint.text = @"下面 6 个开关是占位：你后续自己绑定功能即可";
+    hint.text = @"注意：吃软件为辅助工具，仅供娱乐，不可非法使用";
     [gPanel addSubview:hint];
 
     // 6 个开关按钮（2列×3行）
