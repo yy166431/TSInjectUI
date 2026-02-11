@@ -2,32 +2,13 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 
-#define TSLOG(fmt, ...) NSLog((@"[TSINJECT] " fmt), ##__VA_ARGS__)
-
 #pragma mark - ====== Report to Server (no console needed) ======
 
 static NSString * const TS_REPORT_URL   = @"http://159.75.14.193:8099/api/mjlog";
 // 如果你服务端启用了 token（LOG_TOKEN），就把下面改成同一个值；如果没启用，留空即可
-static NSString * const TS_REPORT_TOKEN = @""; // ignored in test
+static NSString * const TS_REPORT_TOKEN = @"";  // e.g. @"your_token_here"
 
 // 简单 ISO8601 时间
-
-static void TSAppendLocal(NSString *line) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
-    NSString *dir = paths.firstObject ?: NSTemporaryDirectory();
-    NSString *path = [dir stringByAppendingPathComponent:@"tsinject_report.log"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    }
-    if (!fh) return;
-    [fh seekToEndOfFile];
-    NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-    [fh writeData:d];
-    [fh closeFile];
-}
-
 static NSString *TSNowISO8601(void) {
     NSDateFormatter *f = [NSDateFormatter new];
     f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
@@ -36,144 +17,44 @@ static NSString *TSNowISO8601(void) {
     return [f stringFromDate:[NSDate date]];
 }
 
-static BOOL TSSendRawJSON(NSDictionary *obj, NSInteger *outStatus, NSString **outResp) {
-    if (!TS_REPORT_URL.length) return NO;
+static void TSReportJSON(NSDictionary *obj) {
+    if (!TS_REPORT_URL.length) return;
 
     NSError *err = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:&err];
-    if (!data || err) {
-        TSLOG(@"json encode fail: %@", err.localizedDescription ?: @"");
-        TSAppendLocal([NSString stringWithFormat:@"[%@] json encode fail: %@", TSNowISO8601(), err.localizedDescription ?: @""]);
-        return NO;
-    }
+    if (!data || err) return;
 
     NSURL *url = [NSURL URLWithString:TS_REPORT_URL];
-    if (!url) {
-        TSLOG(@"bad url: %@", TS_REPORT_URL);
-        TSAppendLocal([NSString stringWithFormat:@"[%@] bad url: %@", TSNowISO8601(), TS_REPORT_URL]);
-        return NO;
-    }
+    if (!url) return;
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    // 测试阶段：忽略 token（不发、不校验）
-    req.HTTPBody = data;
-    req.timeoutInterval = 4.0;
 
-    __block NSInteger status = 0;
-    __block NSString *respStr = @"";
-    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable d, NSURLResponse * _Nullable r, NSError * _Nullable e) {
-        if (e) {
-            TSLOG(@"POST fail: %@", e.localizedDescription ?: @"");
-            TSAppendLocal([NSString stringWithFormat:@"[%@] POST fail: %@", TSNowISO8601(), e.localizedDescription ?: @""]);
-            dispatch_semaphore_signal(sema);
-            return;
-        }
-        if ([r isKindOfClass:[NSHTTPURLResponse class]]) {
-            status = ((NSHTTPURLResponse *)r).statusCode;
-        }
-        if (d.length) {
-            respStr = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
-        }
-        dispatch_semaphore_signal(sema);
-    }] resume];
-
-    dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)));
-
-    if (outStatus) *outStatus = status;
-    if (outResp) *outResp = respStr;
-    return (status >= 200 && status < 300);
-}
-
-#pragma mark - ====== Report Queue (rate-limit + retry) ======
-
-static NSString *gMatchID = nil;
-static NSMutableArray<NSDictionary *> *gQueue = nil;
-static BOOL gFlushing = NO;
-static CFAbsoluteTime gLastSnapshotTS = 0;
-
-static NSString *TSNewMatchID(void) { return [NSUUID UUID].UUIDString; }
-
-static void TSEnsureQueue(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        gQueue = [NSMutableArray array];
-        gMatchID = TSNewMatchID();
-    });
-}
-
-static BOOL TSAllowSnapshot(void) {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastSnapshotTS < 1.0) return NO;
-    gLastSnapshotTS = now;
-    return YES;
-}
-
-static void TSFlushQueue(void);
-
-static void TSEnqueueEvent(NSString *type, NSDictionary *payload) {
-    // snapshot 限频（1 秒 1 次）
-    if (type && [type isEqualToString:@"snapshot"] && !TSAllowSnapshot()) {
-        return;
+    if (TS_REPORT_TOKEN.length) {
+        [req setValue:TS_REPORT_TOKEN forHTTPHeaderField:@"X-Log-Token"];
     }
-    TSEnsureQueue();
 
+    req.HTTPBody = data;
+    req.timeoutInterval = 5.0;
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    NSURLSessionDataTask *task =
+    [session dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {}];
+    [task resume];
+}
+
+static void TSReport(NSString *type, NSDictionary *payload) {
     NSMutableDictionary *obj = [NSMutableDictionary dictionary];
     obj[@"t"] = TSNowISO8601();
     obj[@"type"] = type ?: @"unknown";
     obj[@"payload"] = payload ?: @{};
     obj[@"device"] = UIDevice.currentDevice.model ?: @"";
     obj[@"sys"] = UIDevice.currentDevice.systemVersion ?: @"";
-    obj[@"match_id"] = gMatchID ?: @"";
-
-    @synchronized (gQueue) {
-        [gQueue addObject:obj];
-        if (gQueue.count > 200) [gQueue removeObjectAtIndex:0];
-    }
-    TSFlushQueue();
+    if (TS_REPORT_TOKEN.length) obj[@"token"] = TS_REPORT_TOKEN; // 兼容 body token
+    TSReportJSON(obj);
 }
-
-static void TSFlushQueue(void) {
-    if (gFlushing) return;
-    gFlushing = YES;
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        while (1) {
-            NSDictionary *next = nil;
-            @synchronized (gQueue) {
-                if (gQueue.count == 0) break;
-                next = gQueue.firstObject;
-            }
-            if (!next) break;
-
-            NSInteger st = 0;
-            NSString *resp = nil;
-            BOOL ok = TSSendRawJSON(next, &st, &resp);
-
-            TSLOG(@"POST status=%ld ok=%d", (long)st, ok ? 1 : 0);
-            if (!ok) {
-                // 网络/服务器失败：先停，等待下次触发再重试
-                break;
-            }
-
-            @synchronized (gQueue) {
-                if (gQueue.count > 0) [gQueue removeObjectAtIndex:0];
-            }
-        }
-        gFlushing = NO;
-    });
-}
-
-
-
-static void TSReport(NSString *type, NSDictionary *payload) {
-    // 统一走队列，真机无控制台也能稳定上报
-    TSEnqueueEvent(type, payload);
-}
-
 
 #pragma mark - ====== Globals ======
 
@@ -188,6 +69,53 @@ static UILabel *gTotalLabel = nil;
 static NSString * const kEnabledKey = @"tsinject_enabled";
 static NSString * const kPosXKey    = @"tsinject_btn_x";
 static NSString * const kPosYKey    = @"tsinject_btn_y";
+
+// ====== Extra feature switches (placeholders for your future functions) ======
+static NSString * const kSw1Key = @"tsinject_sw1";
+static NSString * const kSw2Key = @"tsinject_sw2";
+static NSString * const kSw3Key = @"tsinject_sw3";
+static NSString * const kSw4Key = @"tsinject_sw4";
+static NSString * const kSw5Key = @"tsinject_sw5";
+static NSString * const kSw6Key = @"tsinject_sw6";
+
+static BOOL gSw[6] = {0};
+static UIButton *gSwBtn[6] = {nil};
+
+static NSString *TSOnOff(BOOL v) { return v ? @"ON" : @"OFF"; }
+static NSString *TSKeyForIndex(int i) {
+    switch (i) {
+        case 0: return kSw1Key;
+        case 1: return kSw2Key;
+        case 2: return kSw3Key;
+        case 3: return kSw4Key;
+        case 4: return kSw5Key;
+        case 5: return kSw6Key;
+        default: return kSw1Key;
+    }
+}
+
+static void TSLoadSwitches(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    for (int i = 0; i < 6; i++) {
+        gSw[i] = [ud boolForKey:TSKeyForIndex(i)];
+    }
+}
+
+static void TSSaveSwitch(int i) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setBool:gSw[i] forKey:TSKeyForIndex(i)];
+    [ud synchronize];
+}
+
+static void TSRefreshSwitchButtons(void) {
+    for (int i = 0; i < 6; i++) {
+        if (!gSwBtn[i]) continue;
+        NSString *title = [NSString stringWithFormat:@"功能%d: %@", i+1, TSOnOff(gSw[i])];
+        [gSwBtn[i] setTitle:title forState:UIControlStateNormal];
+        gSwBtn[i].alpha = gSw[i] ? 1.0 : 0.65;
+    }
+}
+
 
 #pragma mark - ====== Mahjong (108 tiles / 27 kinds) ======
 
@@ -255,7 +183,7 @@ static void UndoOne(void) {
 
 #pragma mark - ====== Helpers ======
 
-static __attribute__((unused)) UIWindow *TSKeyWindow(void) {
+static UIWindow *TSKeyWindow(void) {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
@@ -281,8 +209,8 @@ static UIViewController *TopVC(void) {
 }
 
 static void UpdateTitle(void) {
-    if (!gBtn) return;
-    [gBtn setTitle:(gEnabled ? @"ON" : @"OFF") forState:UIControlStateNormal];
+    if (gBtn) [gBtn setTitle:(gEnabled ? @"ON" : @"OFF") forState:UIControlStateNormal];
+    if (gTotalLabel) gTotalLabel.text = [NSString stringWithFormat:@"插件: %@", (gEnabled ? @"ON" : @"OFF")];
 }
 
 #pragma mark - ====== Panel actions handler ======
@@ -317,6 +245,18 @@ void TSRefreshPanel(void);
     TSReport(@"event", @{@"name": @"manual_reset"});
 }
 
+- (void)onSwitchTap:(UIButton *)sender {
+    int i = (int)(sender.tag - 2000);
+    if (i < 0 || i >= 6) return;
+
+    gSw[i] = !gSw[i];
+    TSSaveSwitch(i);
+    TSRefreshSwitchButtons();
+
+    // 这里先只做上报占位，你后续可以在这里绑定实际功能
+    TSReport(@"event", @{@"name": @"switch_tap", @"idx": @(i+1), @"on": @(gSw[i])});
+}
+
 @end
 
 static TSMJPanelHandler *GetPanelHandler(void) {
@@ -349,65 +289,60 @@ void TSRefreshPanel(void) {
 static void BuildPanelIfNeeded(UIView *host) {
     if (gPanel) return;
 
+    TSLoadSwitches();
+
     CGFloat W = 310;
-    CGFloat H = 280;
+    CGFloat H = 250;
 
     gPanel = [[UIView alloc] initWithFrame:CGRectMake(12, 130, W, H)];
     gPanel.layer.cornerRadius = 14;
     gPanel.clipsToBounds = YES;
     gPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
 
+    // 标题 / 状态
     gTotalLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 10, 200, 24)];
     gTotalLabel.textColor = UIColor.whiteColor;
     gTotalLabel.font = [UIFont boldSystemFontOfSize:16];
     [gPanel addSubview:gTotalLabel];
 
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(12, 34, W-24, 18)];
+    hint.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75];
+    hint.font = [UIFont systemFontOfSize:12];
+    hint.text = @"下面 6 个开关是占位：你后续自己绑定功能即可";
+    [gPanel addSubview:hint];
+
+    // 6 个开关按钮（2列×3行）
+    CGFloat top = 62;
+    CGFloat padding = 12;
+    CGFloat gapX = 10;
+    CGFloat gapY = 10;
+
+    CGFloat btnW = (W - padding*2 - gapX) / 2.0;
+    CGFloat btnH = 46;
+
     TSMJPanelHandler *handler = GetPanelHandler();
 
-    UIButton *undo = [UIButton buttonWithType:UIButtonTypeSystem];
-    undo.frame = CGRectMake(W-60-12, 8, 60, 28);
-    [undo setTitle:@"撤销" forState:UIControlStateNormal];
-    [undo setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    undo.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.15];
-    undo.layer.cornerRadius = 8;
-    [undo addTarget:handler action:@selector(onUndo:) forControlEvents:UIControlEventTouchUpInside];
-    [gPanel addSubview:undo];
+    for (int i = 0; i < 6; i++) {
+        int row = i / 2;
+        int col = i % 2;
 
-    UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
-    reset.frame = CGRectMake(W-60-12-60-10, 8, 60, 28);
-    [reset setTitle:@"重置" forState:UIControlStateNormal];
-    [reset setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    reset.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.15];
-    reset.layer.cornerRadius = 8;
-    [reset addTarget:handler action:@selector(onReset:) forControlEvents:UIControlEventTouchUpInside];
-    [gPanel addSubview:reset];
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        b.tag = 2000 + i;
+        b.frame = CGRectMake(padding + col*(btnW+gapX), top + row*(btnH+gapY), btnW, btnH);
+        b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+        b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
+        b.layer.cornerRadius = 12;
+        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [b addTarget:handler action:@selector(onSwitchTap:) forControlEvents:UIControlEventTouchUpInside];
 
-    // 3行×9列
-    CGFloat top = 46;
-    CGFloat padding = 10;
-    CGFloat gap = 6;
-    CGFloat btnW = (W - padding*2 - gap*8) / 9.0;
-    CGFloat btnH = 66;
-
-    for (int row = 0; row < 3; row++) {
-        for (int col = 0; col < 9; col++) {
-            int t = row*9 + col; // 0..26
-            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-            b.tag = 1000 + t;
-            b.frame = CGRectMake(padding + col*(btnW+gap), top + row*(btnH+gap), btnW, btnH);
-            b.titleLabel.numberOfLines = 2;
-            b.titleLabel.textAlignment = NSTextAlignmentCenter;
-            b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-            b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
-            b.layer.cornerRadius = 10;
-            [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-            [b addTarget:handler action:@selector(onTileTap:) forControlEvents:UIControlEventTouchUpInside];
-            [gPanel addSubview:b];
-        }
+        gSwBtn[i] = b;
+        [gPanel addSubview:b];
     }
 
+    UpdateTitle();
+    TSRefreshSwitchButtons();
+
     [host addSubview:gPanel];
-    TSRefreshPanel();
 }
 
 static void ShowPanel(UIView *host) {
@@ -415,7 +350,8 @@ static void ShowPanel(UIView *host) {
     BuildPanelIfNeeded(host);
     if (!gPanel.superview) [host addSubview:gPanel];
     gPanel.hidden = NO;
-    TSRefreshPanel();
+    UpdateTitle();
+    TSRefreshSwitchButtons();
 }
 
 static void HidePanel(void) {
@@ -425,6 +361,52 @@ static void HidePanel(void) {
 
 #pragma mark - ====== Auto counter via notifications ======
 
+static BOOL gAutoInstalled = NO;
+
+static void InstallAutoObserverOnce(void) {
+    if (gAutoInstalled) return;
+    gAutoInstalled = YES;
+
+    ResetAll();
+    TSReport(@"event", @{@"name": @"auto_observer_installed"});
+
+    // 自动扣牌通知：
+    // [[NSNotificationCenter defaultCenter] postNotificationName:@"TS_MJ_SEEN"
+    //                                                     object:nil
+    //                                                   userInfo:@{@"tile": @(tileId), @"count": @(n)}];
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"TS_MJ_SEEN"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        NSDictionary *u = note.userInfo ?: @{};
+        NSNumber *tile = u[@"tile"];
+        NSNumber *count = u[@"count"];
+        if (!tile) return;
+
+        int tid = tile.intValue;
+        int cnt = count ? count.intValue : 1;
+
+        // 你也可以改成 OFF 也统计；当前：OFF 不统计
+        if (!gEnabled) {
+            TSReport(@"event", @{@"name": @"auto_seen_ignored_off", @"tile": @(tid), @"count": @(cnt)});
+            return;
+        }
+
+        MarkSeenIdx(tid, cnt);
+        TSRefreshPanel();
+        TSReport(@"event", @{@"name": @"auto_seen", @"tile": @(tid), @"count": @(cnt), @"left": @(gLeft[tid])});
+    }];
+
+    // 开局重置
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"TS_MJ_RESET"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification * _Nonnull note) {
+        ResetAll();
+        TSRefreshPanel();
+        TSReport(@"event", @{@"name": @"auto_reset"});
+    }];
+}
 
 #pragma mark - ====== Passthrough Window ======
 
@@ -482,7 +464,9 @@ static void Toggle(void) {
 
     TSReport(@"event", @{@"name": @"toggle", @"enabled": @(gEnabled)});
 
-    if (gEnabled) {        if (gOverlayWindow && gOverlayWindow.rootViewController) {
+    if (gEnabled) {
+        InstallAutoObserverOnce();
+        if (gOverlayWindow && gOverlayWindow.rootViewController) {
             ShowPanel(gOverlayWindow.rootViewController.view);
         }
     } else {
@@ -552,46 +536,30 @@ static void SetupUI(void) {
     TSReport(@"event", @{@"name": @"setup_ui", @"enabled_restore": @(gEnabled)});
 
     // 如果之前就是 ON，恢复面板
-    if (gEnabled) {        ShowPanel(vc.view);
+    if (gEnabled) {
+        InstallAutoObserverOnce();
+        ShowPanel(vc.view);
     }
 }
 
 #pragma mark - ====== Entry ======
 
 __attribute__((constructor))
-static void TSInstallLifecycleHooks(void) {
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification * _Nonnull note) {
-        TSReport(@"app_active", @{});
-        TSFlushQueue();
-    }];
-}
-
-__attribute__((constructor))
 static void Entry(void) {
-    TSLOG(@"Entry reached (constructor)");
-    TSAppendLocal([NSString stringWithFormat:@"[%@] ENTRY_REACHED", TSNowISO8601()]);
-
     dispatch_async(dispatch_get_main_queue(), ^{
-        TSLOG(@"Main queue reached");
+        // 震动提示：dylib 已加载
         AudioServicesPlaySystemSound(1519);
 
-        TSInstallLifecycleHooks();
+        // 上报：注入成功
+        TSReport(@"event", @{@"name": @"dylib_loaded"});
 
-        // 先上报 dylib_loaded（走队列）
-        TSReport(@"dylib_loaded", @{});
-
-        // 延迟一点再挂 UI，确保场景 ready
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            // 弹窗可选：用于验证加载成功（如果不想弹窗，注释掉即可）
             UIViewController *vc = TopVC();
             if (vc) {
                 UIAlertController *a =
-                [UIAlertController alertControllerWithTitle:@"TSInject"
-                                                    message:@"插件已加载（测试模式）"
+                [UIAlertController alertControllerWithTitle:@"本产品严禁用于赌博"
+                                                    message:@"记牌器（测试）已加载"
                                              preferredStyle:UIAlertControllerStyleAlert];
                 [a addAction:[UIAlertAction actionWithTitle:@"OK"
                                                       style:UIAlertActionStyleDefault
@@ -603,5 +571,3 @@ static void Entry(void) {
         });
     });
 }
-
-
