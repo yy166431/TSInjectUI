@@ -80,6 +80,16 @@ static NSString * const kSw6Key = @"tsinject_sw6";
 
 static BOOL gSw[6] = {0};
 static UIButton *gSwBtn[6] = {nil};
+// ====== 固定功能名字（只允许源码修改，用户无法自定义）======
+static NSString * const kSwitchTitles[6] = {
+    @"增加好牌概率",
+    @"增加自摸概率",
+    @"增加一色概率",
+    @"透视功能测试",
+    @"增加七对概率",
+    @"防御检测点我"
+};
+
 
 static NSString *TSOnOff(BOOL v) { return v ? @"ON" : @"OFF"; }
 static NSString *TSKeyForIndex(int i) {
@@ -110,7 +120,7 @@ static void TSSaveSwitch(int i) {
 static void TSRefreshSwitchButtons(void) {
     for (int i = 0; i < 6; i++) {
         if (!gSwBtn[i]) continue;
-        NSString *title = [NSString stringWithFormat:@"功能%d: %@", i+1, TSOnOff(gSw[i])];
+        NSString *title = [NSString stringWithFormat:@"%@: %@", kSwitchTitles[i], TSOnOff(gSw[i])];
         [gSwBtn[i] setTitle:title forState:UIControlStateNormal];
         gSwBtn[i].alpha = gSw[i] ? 1.0 : 0.65;
     }
@@ -559,7 +569,7 @@ static void Entry(void) {
             if (vc) {
                 UIAlertController *a =
                 [UIAlertController alertControllerWithTitle:@"本产品严禁用于赌博"
-                                                    message:@"记牌器（测试）已加载"
+                                                    message:@"微乐神器 已加载仅供娱乐勿外传"
                                              preferredStyle:UIAlertControllerStyleAlert];
                 [a addAction:[UIAlertAction actionWithTitle:@"OK"
                                                       style:UIAlertActionStyleDefault
